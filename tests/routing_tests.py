@@ -99,10 +99,7 @@ def subset_sum_margin(conductances):
 
 
 def to_coupons(groups):
-    if iopw.LADDER == "binary":
-        return iopw.split_coupons(groups, iopw.MAX_BINARY_INPUTS)
-    return [{"num": g["num"], "sub": 0, "inputs": g["inputs"],
-             "outputs": g["outputs"]} for g in groups]
+    return iopw.split_coupons(groups, iopw.MAX_BINARY_INPUTS)
 
 
 def evaluate(pads):
@@ -173,7 +170,7 @@ def scenarios():
 
 
 def main():
-    print(f"LADDER = {iopw.LADDER!r}, base = {iopw.COIL_BASE_R:.0f} ohm\n")
+    print(f"LADDER = binary, base = {iopw.COIL_BASE_R:.0f} ohm\n")
     header = (f"{'scenario':<18}{'coup':>5}{'in':>4}{'shorts':>7}{'cross':>6}"
               f"{'R_err%':>8}{'decode%':>9}{'maxR':>10}{'prot_um':>9}"
               f"{'die_mm':>12}  result")

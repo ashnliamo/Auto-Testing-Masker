@@ -17,8 +17,6 @@ COIL_GAP = 8.0             # gap between the pad edge and the first comb tooth
 VIA_SIZE = 8.0             # via stitching a 2nd-layer wire up to its top-layer pad
 
 # The shared node is a big rectangular PLANE filling the whole interior of the ring
-# (the resistor combs all sit OUTSIDE it). Each comb returns onto it through a pad
-# gap; each OUTPUT joins it with a low-resistance PAD-WIDTH finger.
 PLANE_RING_MARGIN = 70.0   # keep the plane this far inside the ring (clears pads)
 FINGER_OVERLAP = 60.0      # how far each output finger / return reaches into the plane
 
@@ -26,19 +24,15 @@ FINGER_OVERLAP = 60.0      # how far each output finger / return reaches into th
 METAL_THICKNESS_UM = 0.1     # 1000 angstrom
 AL_RESISTIVITY = 3.243e-8    # ohm*m (Al on 10 A Ti)
 SHEET_RES = AL_RESISTIVITY / (METAL_THICKNESS_UM * 1e-6)   # ohm/square (~0.324)
-# Each input in a group is told apart by its coil resistance. Input k targets:
-#   LADDER "binary"  -> COIL_BASE_R * 2**(k-1)  (conductances are binary-weighted,
-#                       so the parallel reading decodes uniquely to the missing set
-#                       -- but the resistance range, hence trace length, doubles per
-#                       input: only practical for groups up to ~10 inputs).
-#   LADDER "linear"  -> COIL_BASE_R + (k-1)*COIL_STEP_R  (even, compact, but the
-#                       parallel sum can be ambiguous for some missing subsets).
-LADDER = "binary"
+# Each input in a group is told apart by its coil resistance. Input k targets a
+# binary-weighted resistance COIL_BASE_R * 2**(k-1), so the conductances are
+# binary-weighted and the parallel reading decodes uniquely to the missing set --
+# but the resistance range, hence trace length, doubles per input, so it is only
+# practical for groups up to ~10 inputs (larger groups are split, see below).
 COIL_BASE_R = 500.0          # ohms for the smallest coil in a group (k = 1)
-COIL_STEP_R = 100.0          # ohms between adjacent inputs (linear ladder only)
-# Binary mode only: a group with more than this many inputs is split into several
-# independent sub-coupons of <= this many inputs each (kept on separate chips), so
-# every coupon's resistance range -- and its parallel-decode margin -- stays sane.
+# A group with more than this many inputs is split into several independent
+# sub-coupons of <= this many inputs each (kept on separate chips), so every
+# coupon's resistance range -- and its parallel-decode margin -- stays sane.
 MAX_BINARY_INPUTS = 6
 
 # Calibration coupon: a separate, SELF-SIZED GDS (its own die, independent of the
@@ -222,10 +216,9 @@ ROUTE_PITCH = WIRE_WIDTH + WIRE_SPACE   # tooth pitch: adjacent traces sit WIRE_
 
 
 def input_target_r(k):
-    """Target resistance (ohms) for the k-th input of a group (k counts from 1)."""
-    if LADDER == "binary":
-        return COIL_BASE_R * (2 ** (k - 1))
-    return COIL_BASE_R + (k - 1) * COIL_STEP_R
+    """Target resistance (ohms) for the k-th input of a group (k counts from 1):
+    a binary-weighted COIL_BASE_R * 2**(k-1)."""
+    return COIL_BASE_R * (2 ** (k - 1))
 
 
 def input_target_len(k):
@@ -545,8 +538,10 @@ def square_meander(x_left, top_y, target_len):
 def build_calibration(resistances):
     """One big COMMON pad joined through a known meander resistor to each of several
     big probe pads (all on metal 1), each labelled with its theoretical resistance
-    and trace length. The coupon sizes its OWN die to just fit its content (it does
-    NOT track the test-chip die). Returns (library, csv_rows, die_w, die_h)."""
+    and trace length. The coupon uses the SAME die size as the test chips
+    (DIE_W x DIE_H, set in size_and_place) with its content centred; it only grows
+    past that if its own content would not otherwise fit. Returns
+    (library, csv_rows, die_w, die_h)."""
     L = metal_layer(0)
     blocks = []
     for R in resistances:
@@ -557,12 +552,14 @@ def build_calibration(resistances):
     col_w = [max(b["w"], CALIB_PAD) for b in blocks]
     total_w = sum(col_w) + CALIB_GAP * (len(blocks) - 1)
     band_h = CALIB_PAD + CALIB_GAP + hmax + CALIB_GAP + CALIB_PAD + 2 * CALIB_LABEL
-    die_w, die_h = total_w + 2 * CALIB_GAP, band_h + 2 * CALIB_GAP   # self-sized
+    # Match the test-chip die; only enlarge if the content would not fit inside it.
+    content_w, content_h = total_w + 2 * CALIB_GAP, band_h + 2 * CALIB_GAP
+    die_w, die_h = max(DIE_W, content_w), max(DIE_H, content_h)
 
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
     cell = lib.new_cell("CALIB")
-    x0 = CALIB_GAP
-    bus_top = -CALIB_GAP
+    x0 = (die_w - total_w) / 2.0            # centre the column band horizontally
+    bus_top = -(die_h - band_h) / 2.0       # centre the content band vertically
     bus_bot = bus_top - CALIB_PAD
     mnd_top = bus_bot - CALIB_GAP
     pad_top = mnd_top - hmax - CALIB_GAP
@@ -742,13 +739,9 @@ def main():
     if not inputs or not outputs:
         raise SystemExit("Need at least one input and one output.")
     groups = assign_groups(inputs, outputs)
-    # In binary mode big groups are split into independent <= MAX_BINARY_INPUTS
-    # sub-coupons; in linear mode each group is one coupon.
-    if LADDER == "binary":
-        coupons = split_coupons(groups, MAX_BINARY_INPUTS)
-    else:
-        coupons = [{"num": g["num"], "sub": 0, "inputs": g["inputs"],
-                    "outputs": g["outputs"]} for g in groups]
+    # Big groups are split into independent <= MAX_BINARY_INPUTS sub-coupons so each
+    # coupon's resistance range -- and its parallel-decode margin -- stays sane.
+    coupons = split_coupons(groups, MAX_BINARY_INPUTS)
 
     # Size the die from the real coil protrusions and place the ring (see the
     # bottom-layer rules in size_and_place).
@@ -760,11 +753,10 @@ def main():
     print(f"Aluminium {METAL_THICKNESS_UM} um thick, W={WIRE_WIDTH} um -> "
           f"sheet res {SHEET_RES:.3f} ohm/sq; {WIRE_WIDTH/SHEET_RES:.1f} um per ohm.")
     big = max((len(c["inputs"]) for c in coupons), default=0)
-    if LADDER == "binary" and (input_target_r(big) > 1e6 or max(DIE_W, DIE_H) > 5e4):
+    if input_target_r(big) > 1e6 or max(DIE_W, DIE_H) > 5e4:
         print(f"  ! BINARY ladder still needs a {input_target_r(big):,.0f} ohm "
               f"resistor (a {big}-input coupon) and a {DIE_W/1000:.0f} x "
-              f"{DIE_H/1000:.0f} mm die -- lower MAX_BINARY_INPUTS or set "
-              f"LADDER='linear'.")
+              f"{DIE_H/1000:.0f} mm die -- lower MAX_BINARY_INPUTS.")
     matched = [g["num"] for g in groups]
     wired_in = sum(len(g["inputs"]) for g in groups)
     print(f"Matched group number(s) {matched}: {len(groups)} group(s), "
@@ -823,7 +815,9 @@ def main():
         w = csv.writer(f)
         w.writerow(["target_R_ohm", "theoretical_R_ohm", "squares", "trace_len_um"])
         w.writerows(calib_rows)
-    print(f"Wrote {calib_gds.name}: own {cdw/1000:.1f}x{cdh/1000:.1f} mm die, COMMON "
+    fit = "" if (cdw, cdh) == (DIE_W, DIE_H) else " (enlarged to fit its content)"
+    print(f"Wrote {calib_gds.name}: {cdw/1000:.1f}x{cdh/1000:.1f} mm die "
+          f"matching the test chips{fit}, COMMON "
           f"pad + {len(calib_rows)} probe pads "
           f"({', '.join(r[0] + ' ohm' for r in calib_rows)}); measure each vs COMMON, "
           f"then actual sheet res = R_measured / squares.")
