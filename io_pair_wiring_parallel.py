@@ -13,7 +13,7 @@ OUTPUT_DIR = HERE / "outputs"
 PAD_SIZE = 80.0
 WIRE_WIDTH = 3.0           # aluminium trace width (narrow -> compact combs, R ~ 1/W^2)
 WIRE_SPACE = 3.0           # gap between adjacent comb teeth
-COIL_GAP = 8.0             # gap between the pad edge and the first comb tooth
+COIL_GAP = 38.0            # gap between the pad edge and the first comb tooth
 VIA_SIZE = 8.0             # via stitching a 2nd-layer wire up to its top-layer pad
 
 # The shared node is a big rectangular PLANE filling the whole interior of the ring
@@ -24,24 +24,9 @@ FINGER_OVERLAP = 60.0      # how far each output finger / return reaches into th
 METAL_THICKNESS_UM = 0.1     # 1000 angstrom
 AL_RESISTIVITY = 3.243e-8    # ohm*m (Al on 10 A Ti)
 SHEET_RES = AL_RESISTIVITY / (METAL_THICKNESS_UM * 1e-6)   # ohm/square (~0.324)
-# Each input in a group is told apart by its coil resistance. Input k targets a
-# binary-weighted resistance COIL_BASE_R * 2**(k-1), so the conductances are
-# binary-weighted and the parallel reading decodes uniquely to the missing set --
-# but the resistance range, hence trace length, doubles per input, so it is only
-# practical for groups up to ~10 inputs (larger groups are split, see below).
-COIL_BASE_R = 500.0          # ohms for the smallest coil in a group (k = 1)
-# A group with more than this many inputs is split into several independent
-# sub-coupons of <= this many inputs each (kept on separate chips), so every
-# coupon's resistance range -- and its parallel-decode margin -- stays sane.
+COIL_BASE_R = 500.0          # ohms for the smallest coil in a group
 MAX_BINARY_INPUTS = 6
 
-# Calibration coupon: a separate, SELF-SIZED GDS (its own die, independent of the
-# test chips) with one big COMMON pad tied through a known meander resistor to each
-# of several big probe pads, so a human can measure the real resistance with a
-# multimeter and back out the actual sheet resistance (deposition varies from the
-# theoretical value). The probe resistances MATCH the on-chip ladder (the first
-# CALIB_COUNT steps of input_target_r), and each pad is labelled with its
-# theoretical resistance and trace length.
 CALIB_COUNT = 8              # number of calibration resistors (first N ladder steps)
 CALIB_PAD = 1500.0           # big square probe pad (um) -- >= 1.5 mm for a multimeter
 CALIB_LABEL = 150.0          # label height (um) on the calibration coupon
@@ -50,9 +35,6 @@ CALIB_GAP = 200.0            # spacing between calibration columns / pads (and m
 ADD_LABELS = True
 LABEL_SIZE = 12.0
 ADD_DIE_OUTLINE = True
-# The die outline (bottom layer) is built LAST in main(), kept proportional to the
-# pad ring, and just large enough to clear the farthest-protruding comb by this
-# margin (the other edges end up with more clearance to keep the aspect ratio).
 DIE_MARGIN_BUFFER = 100.0    # clearance beyond the farthest-protruding resistor (um)
 DIE_W = DIE_H = 0.0          # set in main()
 
@@ -253,89 +235,97 @@ def near_edge_coords(pads, bounds):
     return out
 
 
-COMB_MARGIN = PAD_SIZE / 2.0 + WIRE_SPACE + WIRE_WIDTH   # clearance to the next coil
+CORNER_INSET = PAD_SIZE + WIRE_SPACE             # keep combs clear of the ring corners
+LEAD_RADIUS = PAD_SIZE / 2.0 + COIL_GAP / 2.0    # pad->comb lead lane (under the teeth)
 
 
-def coil_build(inp, group, bounds, edge_coords):
-    """Decide which way a coil's comb spreads and how wide. It grows toward the side
-    (-v or +v along its edge) with MORE free room -- out toward the next same-group
-    input over the un-wired columns -- so a pad jammed against a corner still gets a
-    wide, shallow comb from its open side. A slot shared with a same-group
-    neighbour is split at the midpoint (room/2) so the two combs meet but never
-    overlap; an open end runs to the last real gap. Returns (s, span): s = +1/-1
-    direction along v, span = um of reach."""
-    e = edge_of(inp, bounds)
-    _, v = inward_along(e)
-    a = inp["x"] * v[0] + inp["y"] * v[1]
-    ec = edge_coords[e]
-    first_gap = (ec[0] + ec[1]) / 2.0 if len(ec) > 1 else ec[0]
-    last_gap = (ec[-2] + ec[-1]) / 2.0 if len(ec) > 1 else ec[-1]
-    sg = [p["x"] * v[0] + p["y"] * v[1] for p in group["inputs"]
-          if edge_of(p, bounds) == e]
-    prev = [c for c in sg if c < a - 1.0]
-    nxt = [c for c in sg if c > a + 1.0]
-    plus = ((min(nxt) - a) / 2.0 if nxt else (last_gap - a))   # +v room (split if shared)
-    minus = ((a - max(prev)) / 2.0 if prev else (a - first_gap))
-    s, room = (1, plus) if plus >= minus else (-1, minus)
-    return s, max(PAD_SIZE, room - COMB_MARGIN)
+def to_xy(e, t, r, bounds):
+    """Point at along-edge coordinate `t` and outward radius `r` (measured from the
+    ring edge line) on edge `e`. r > 0 is OUTSIDE the ring, where the comb sits;
+    r < 0 is inside, toward the central plane."""
+    minx, maxx, miny, maxy = bounds
+    if e == "left":
+        return (minx - r, t)
+    if e == "right":
+        return (maxx + r, t)
+    if e == "bottom":
+        return (t, miny - r)
+    return (t, maxy + r)                                  # top
 
 
-def comb_teeth(span, target_len):
-    """Even number of teeth for a `target_len` comb of width `span`. Capped so each
-    tooth stays at least ~a routing pitch deep (otherwise depth would clamp and the
-    length -- hence resistance -- would drift off its rung)."""
-    fit = int(span / ROUTE_PITCH)                       # teeth that fit across span
-    deep_enough = int(target_len / (4.0 * ROUTE_PITCH))  # keep depth >= ~4 pitches
-    return max(2, min(fit, deep_enough) // 2 * 2)
+def edge_along_range(e, bounds):
+    """Usable along-edge interval for edge `e`, inset from the ring corners so combs
+    on adjacent edges can't collide at a corner."""
+    minx, maxx, miny, maxy = bounds
+    lo, hi = (miny, maxy) if e in ("left", "right") else (minx, maxx)
+    return lo + CORNER_INSET, hi - CORNER_INSET
 
 
-def comb_plan(a, s, span, target_len, coords):
-    """Pick the comb's tooth count `m` and a small lateral `lead` so its far end
-    lands in the centre of a pad-to-pad GAP. The return can then drop straight
-    inward through that gap without sliding sideways across any other comb. Searches
-    even tooth counts that fit the span, preferring ones whose far end is already
-    within half a pitch of a gap (tiny lead) and closest to the natural count."""
-    fit = max(2, int(span / ROUTE_PITCH) // 2 * 2)
-    m0 = comb_teeth(span, target_len)
-    mids = [(coords[i] + coords[i + 1]) / 2.0 for i in range(len(coords) - 1)] or [a]
-    cands = []
-    for m in range(2, fit + 1, 2):
-        far = a + s * (m - 1) * ROUTE_PITCH
-        g = min(mids, key=lambda c: abs(c - far))
-        cands.append((abs(g - far), m, g))
-    aligned = [c for c in cands if c[0] <= ROUTE_PITCH / 2.0 + 0.5]
-    _, m, g = (min(aligned, key=lambda c: (abs(c[1] - m0), c[0])) if aligned
-               else min(cands, key=lambda c: c[0]))
-    return m, s * (g - a) - (m - 1) * ROUTE_PITCH
+def edge_gaps(e, edge_coords):
+    """Along-edge centres of the pad-to-pad gaps on edge `e` -- a comb's return drops
+    inward through one of these, threading between pads without touching them."""
+    c = edge_coords[e]
+    return [(c[i] + c[i + 1]) / 2.0 for i in range(len(c) - 1)]
 
 
-def make_outside_comb(px, py, cu, v, m, depth, lead):
-    """Radial-teeth resistor OUTSIDE the ring: `m` teeth (even), each a radial
-    finger of length `depth` stepping +v by ROUTE_PITCH, joined alternately at
-    their outer/inner ends. Terminal A is the pad; the far end B is the last tooth's
-    INNER end -- always at the inner radius regardless of `depth`, so the coil length
-    is exactly linear in `depth` and solves cleanly to its target resistance. `lead`
-    offsets the whole comb along v so B lands on a gap. Returns (pts, far_end)."""
-    hp = PAD_SIZE / 2.0
-    r0 = hp + COIL_GAP
+def edge_inputs(group, bounds):
+    """Same-group inputs bucketed by ring edge, each list sorted by along-coordinate
+    and tagged (along, target_len, pad); target_len comes from the ladder rank."""
+    ranks = {id(p): k for k, p in enumerate(ordered_inputs(group), 1)}
+    by_edge = {}
+    for p in group["inputs"]:
+        e = edge_of(p, bounds)
+        _, v = inward_along(e)
+        a = p["x"] * v[0] + p["y"] * v[1]
+        by_edge.setdefault(e, []).append((a, input_target_len(ranks[id(p)]), p))
+    for e in by_edge:
+        by_edge[e].sort(key=lambda it: it[0])
+    return by_edge
 
-    def pt(lat, dep):
-        return (px + cu[0] * dep + v[0] * lat, py + cu[1] * dep + v[1] * lat)
 
-    pts = [(px + cu[0] * hp, py + cu[1] * hp)]            # pad outer edge
-    out = True
-    for j in range(m):
-        lat = lead + j * ROUTE_PITCH
-        if out:                                          # tooth in -> out
-            pts += [pt(lat, r0), pt(lat, r0 + depth)]
-            if j < m - 1:
-                pts.append(pt(lat + ROUTE_PITCH, r0 + depth))
-        else:                                            # tooth out -> in
-            pts += [pt(lat, r0 + depth), pt(lat, r0)]
-            if j < m - 1:
-                pts.append(pt(lat + ROUTE_PITCH, r0))
-        out = not out
-    return pts, pt(lead + (m - 1) * ROUTE_PITCH, r0)
+def solve_bands(items, edge_lo, edge_hi):
+    """Partition [edge_lo, edge_hi] into one contiguous along-edge BAND per input
+    (kept in pad order) so that (a) every band strictly contains its own pad and
+    (b) band widths are as close to proportional to each input's trace length as the
+    pad positions allow. A comb folded to fill its band has depth = len*pitch/width,
+    so length-proportional widths LEVEL the depth across the edge -- making the
+    deepest comb, which sets the die size, as shallow as the pads permit. Because the
+    bands are disjoint and each holds its pad, every comb stays in its own band and
+    no two combs can ever touch. Returns [(lo, hi)] aligned with `items`."""
+    n = len(items)
+    a = [it[0] for it in items]
+    if n == 1:
+        return [(edge_lo, edge_hi)]
+    need = [it[1] * ROUTE_PITCH for it in items]          # wire area = width * depth
+    eps = WIRE_SPACE + WIRE_WIDTH                          # keep neighbouring combs apart
+
+    def cuts_for(depth):
+        """Band boundaries giving every comb width >= need/depth (depth <= `depth`),
+        each band still holding its pad; None if the pad spacing makes it impossible."""
+        cuts, prev = [], edge_lo
+        for i in range(n - 1):
+            c = min(max(prev + need[i] / depth, a[i] + eps), a[i + 1] - eps)
+            if c - prev < need[i] / depth - 1e-6 or not prev <= a[i] <= c:
+                return None
+            cuts.append(c)
+            prev = c
+        if edge_hi - prev < need[-1] / depth - 1e-6 or not prev <= a[-1] <= edge_hi:
+            return None
+        return cuts
+
+    hi = max(need)                          # width >= ~1 um per comb: surely feasible
+    while cuts_for(hi) is None:
+        hi *= 2.0
+    lo = 1e-9
+    for _ in range(50):                     # smallest feasible (uniform) depth
+        mid = (lo + hi) / 2.0
+        if cuts_for(mid) is None:
+            lo = mid
+        else:
+            hi = mid
+    cuts = cuts_for(hi) or [(a[i] + a[i + 1]) / 2.0 for i in range(n - 1)]
+    edges = [edge_lo] + cuts + [edge_hi]
+    return [(edges[i], edges[i + 1]) for i in range(n)]
 
 
 def return_through_gap(px, py, far_end, cu, plane):
@@ -356,22 +346,142 @@ def return_through_gap(px, py, far_end, cu, plane):
     return [far_end, land, into]
 
 
-def build_coil(px, py, cu, v, a, s, span, target_len, coords_e, plane):
-    """One input's comb plus its straight-inward return, with the tooth depth solved
-    so the total trace length equals `target_len` EXACTLY (length is linear in depth,
-    so two iterations nail it). Geometry is relative to the pad, so this gives the
-    same shape whether the pad is at its raw or its placed position. Returns
-    (coil_pts, return_pts, total_length)."""
-    vlat = (s * v[0], s * v[1])
-    m, lead = comb_plan(a, s, span, target_len, coords_e)
+# A right-angle bend conducts ~CORNER_SQUARES squares, not the ~1.0 that counting the
+# centre-line length through the corner assigns it (current crowds to the inside of the
+# turn). A wide-shallow comb has ~2 bends per tooth, so this is a real correction.
+CORNER_SQUARES = 0.56
+
+
+def _overlap(a0, a1, b0, b1):
+    lo, hi = max(min(a0, a1), min(b0, b1)), min(max(a0, a1), max(b0, b1))
+    return max(0.0, hi - lo)
+
+
+def _seg_outside(p, q, nodes):
+    """Length of axis-aligned segment p->q lying OUTSIDE every (equipotential) node
+    rectangle. Nodes here (pad, plane) don't overlap each other, so the max covered
+    length is the covered length."""
+    length = math.dist(p, q)
+    if length < 1e-9:
+        return 0.0
+    horiz, vert = abs(p[1] - q[1]) < 1e-6, abs(p[0] - q[0]) < 1e-6
+    if not (horiz or vert):
+        return length                                  # no diagonal traces in practice
+    covered = 0.0
+    for rx0, ry0, rx1, ry1 in nodes:
+        if horiz and ry0 - 1e-6 <= p[1] <= ry1 + 1e-6:
+            covered = max(covered, _overlap(p[0], q[0], rx0, rx1))
+        elif vert and rx0 - 1e-6 <= p[0] <= rx1 + 1e-6:
+            covered = max(covered, _overlap(p[1], q[1], ry0, ry1))
+    return max(0.0, length - covered)
+
+
+def _in_node(p, nodes):
+    return any(rx0 - 1e-6 <= p[0] <= rx1 + 1e-6 and ry0 - 1e-6 <= p[1] <= ry1 + 1e-6
+              for rx0, ry0, rx1, ry1 in nodes)
+
+
+def _is_corner(a, b, c):
+    d1, d2 = (b[0] - a[0], b[1] - a[1]), (c[0] - b[0], c[1] - b[1])
+    return (abs(d1[0] * d2[0] + d1[1] * d2[1]) < 1e-6
+            and (d1[0] or d1[1]) and (d2[0] or d2[1]))
+
+
+def resistive_length(pts, nodes):
+    """Effective resistive trace length (um) of an axis-aligned polyline: the
+    centre-line length lying OUTSIDE the equipotential `nodes` (the wide pad and plane
+    metal carry ~0 ohm), minus a per-bend correction (a right-angle corner conducts
+    ~CORNER_SQUARES squares, not the ~1 a straight square count gives it). The real
+    resistance is then SHEET_RES * resistive_length / WIRE_WIDTH -- i.e. this counts
+    the actual conducting metal, including the lead and return, not just the nominal
+    coil length."""
+    clean = [pts[0]]
+    for p in pts[1:]:
+        if abs(p[0] - clean[-1][0]) > 1e-9 or abs(p[1] - clean[-1][1]) > 1e-9:
+            clean.append(p)
+    straight = sum(_seg_outside(clean[i], clean[i + 1], nodes)
+                   for i in range(len(clean) - 1))
+    bends = sum(1 for i in range(1, len(clean) - 1)
+                if _is_corner(clean[i - 1], clean[i], clean[i + 1])
+                and not _in_node(clean[i], nodes))
+    return max(0.0, straight - (1.0 - CORNER_SQUARES) * WIRE_WIDTH * bends)
+
+
+def build_band_coil(pad, e, band, target_len, gaps, bounds, plane):
+    """Fold one input's resistor into a compact radial-teeth comb that FILLS its
+    along-edge `band`, so it is wide and shallow, with the tooth depth solved so the
+    total trace length -- lead + teeth + return -- equals `target_len` (length is
+    linear in depth, so a few iterations nail it). A short lead joins the pad to the
+    near end of the band; the comb runs to the far end, whose last tooth is parked on
+    a pad gap so the return drops straight inward to the plane. Every point stays
+    within the band, so combs of different inputs can never touch. Returns
+    (coil_pts, return_pts, R_ohm, total_length) -- R_ohm is the ACTUAL extracted
+    resistance (corner- and pad/plane-corrected, see resistive_length), which differs
+    from SHEET*total_length/W because of the bends and the wide-metal overlaps."""
+    lo, hi = band
+    u, v = inward_along(e)
+    cu = (-u[0], -u[1])                                    # outward, away from the ring
+    a_pad = pad["x"] * v[0] + pad["y"] * v[1]
+    r0 = PAD_SIZE / 2.0 + COIL_GAP
+    blo = lo + (WIRE_SPACE + WIRE_WIDTH) / 2.0
+    bhi = hi - (WIRE_SPACE + WIRE_WIDTH) / 2.0
+    # Tooth count: as many as the band can hold (wide, shallow), but no more than the
+    # length warrants -- so a short resistor stays compact near its pad instead of
+    # being stretched thin across a big band (which would overshoot its target).
+    fit = max(2, int((bhi - blo) / ROUTE_PITCH) // 2 * 2)
+    cap = max(2, int(target_len / (4.0 * ROUTE_PITCH)) // 2 * 2)   # depth >= ~4 pitches
+    in_band = [g for g in gaps if blo <= g <= bhi]
+    # Park the comb in the band so its FAR end (the return) lands on a pad gap and its
+    # NEAR end (the lead) is as close to the pad as possible. Use as many teeth as the
+    # band holds (wide, shallow) but no more than the length warrants; if a near
+    # full-width comb leaves no slack to reach a gap, drop teeth until one is reachable
+    # -- so the comb (and its return) always stays inside the band.
+    m, t0, s, far_gap = min(fit, cap), None, None, None
+    while m >= 2:
+        reach = (m - 1) * ROUTE_PITCH
+        cands = []
+        for g in in_band:
+            if g - reach >= blo - 1e-6:                    # g = far (high) end
+                cands.append((abs(a_pad - (g - reach)), g - reach, 1.0, g))
+            if g + reach <= bhi + 1e-6:                    # g = far (low) end
+                cands.append((abs(a_pad - (g + reach)), g + reach, -1.0, g))
+        if cands:
+            _, t0, s, far_gap = min(cands, key=lambda c: c[0])
+            break
+        m -= 2
+    if t0 is None:                                         # band holds no gap: best-effort
+        m, reach, s = 2, ROUTE_PITCH, 1.0
+        t0 = max(blo, min(a_pad, bhi - reach))
+        far_gap = t0 + s * reach
+
+    def build(depth):
+        P = lambda t, r: to_xy(e, t, r, bounds)
+        pts = [(pad["x"], pad["y"]), P(a_pad, LEAD_RADIUS),
+               P(t0, LEAD_RADIUS), P(t0, r0)]              # pad -> lead lane -> tooth 0
+        out = True
+        for j in range(m):
+            t = t0 + s * j * ROUTE_PITCH
+            if out:                                        # tooth in -> out
+                pts += [P(t, r0), P(t, r0 + depth)]
+                if j < m - 1:
+                    pts.append(P(t + s * ROUTE_PITCH, r0 + depth))
+            else:                                          # tooth out -> in
+                pts += [P(t, r0 + depth), P(t, r0)]
+                if j < m - 1:
+                    pts.append(P(t + s * ROUTE_PITCH, r0))
+            out = not out
+        ret = return_through_gap(0.0, 0.0, P(far_gap, r0), cu, plane)
+        return pts, ret
+
     depth, coil, ret, clen = target_len / m, None, None, 0.0
-    for _ in range(2):
-        cpts, far_end = make_outside_comb(px, py, cu, vlat, m, depth, lead)
-        coil = [(px, py)] + cpts
-        ret = return_through_gap(px, py, far_end, cu, plane)
+    for _ in range(3):
+        coil, ret = build(depth)
         clen = polyline_len(coil) + polyline_len(ret)
         depth = max(ROUTE_PITCH, depth + (target_len - clen) / m)
-    return coil, ret, clen
+    hp = PAD_SIZE / 2.0                                    # actual resistance of the
+    nodes = [(pad["x"] - hp, pad["y"] - hp, pad["x"] + hp, pad["y"] + hp), plane]
+    r_ohm = SHEET_RES * resistive_length(coil + ret, nodes) / WIRE_WIDTH
+    return coil, ret, r_ohm, clen
 
 
 # ----------------------------------------------------------------------
@@ -408,13 +518,14 @@ def central_plane(bounds):
 def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads):
     """Build one group on metal layer `layer_idx`: a big central PLANE fills the
     interior as the shared node, and every INPUT grows a resistor COMB on the
-    OUTSIDE of the pad ring, spread toward whichever side has more room (next
-    same-group input) so it stays wide and shallow. The comb's far end returns
-    INWARD through a pad gap onto the plane, so the resistor body sits outside and
-    only a thin wire threads between the pads. Each OUTPUT joins the plane with a
-    pad-width finger. Pads are drawn separately on the top layer; for a 2nd-layer
-    group a via at each pad centre drops the metal up to the top-layer pad. Returns
-    (wiring_polys, csv_rows)."""
+    OUTSIDE of the pad ring, folded to fill its own along-edge BAND (width allocated
+    proportional to its trace length) so it stays wide and shallow and the deepest
+    comb -- which sets the die size -- is as shallow as the pads allow. The comb's
+    far end returns INWARD through a pad gap onto the plane, so the resistor body
+    sits outside and only a thin wire threads between the pads. Each OUTPUT joins the
+    plane with a pad-width finger. Pads are drawn separately on the top layer; for a
+    2nd-layer group a via at each pad centre drops the metal up to the top-layer pad.
+    Returns (wiring_polys, csv_rows)."""
     L = metal_layer(layer_idx)
     needs_via = layer_idx > 0
     hp = PAD_SIZE / 2.0
@@ -433,21 +544,25 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads):
     plane = (px0, py0, px1, py1)
     edge_coords = near_edge_coords(all_pads, bounds)
 
+    # Allocate each input a disjoint along-edge band (width proportional to its trace
+    # length) so its comb stays wide and shallow; geometry is solved per band below.
+    band_of, gaps_of = {}, {}
+    for e, items in edge_inputs(group, bounds).items():
+        gaps_of[e] = edge_gaps(e, edge_coords)
+        elo, ehi = edge_along_range(e, bounds)
+        for (a, tl, pad), band in zip(items, solve_bands(items, elo, ehi)):
+            band_of[id(pad)] = (e, band)
+
     rows, r_vals = [], []
     for k, inp in enumerate(ordered_inputs(group), 1):
         target_len = input_target_len(k)
-        e = edge_of(inp, bounds)
-        u, v = inward_along(e)
-        cu = (-u[0], -u[1])                          # outward, away from the ring
-        a = inp["x"] * v[0] + inp["y"] * v[1]
-        s, span = coil_build(inp, group, bounds, edge_coords)
-        coil, ret, clen = build_coil(inp["x"], inp["y"], cu, v, a, s, span,
-                                     target_len, edge_coords[e], plane)
+        e, band = band_of[id(inp)]
+        coil, ret, r, clen = build_band_coil(inp, e, band, target_len,
+                                             gaps_of[e], bounds, plane)
         add(gdstk.FlexPath(coil, WIRE_WIDTH, layer=L, datatype=METAL_DT))
         add(gdstk.FlexPath(ret, WIRE_WIDTH, layer=L, datatype=METAL_DT))
         if needs_via:
             via_at((inp["x"], inp["y"]))
-        r = SHEET_RES * clen / WIRE_WIDTH
         r_vals.append(r)
         rows.append([chip_idx, layer_idx + 1, inp["name"],
                      inp["signal"], ";".join(o["name"] for o in group["outputs"]),
@@ -661,19 +776,17 @@ def size_and_place(pads, groups):
     ring_w, ring_h = max(rxs) - min(rxs), max(rys) - min(rys)
     edge_depth = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
     for g in groups:
-        for k, inp in enumerate(ordered_inputs(g), 1):
-            e = edge_of(inp, raw_bounds)
-            u, v = inward_along(e)
-            cu = (-u[0], -u[1])
-            a = inp["x"] * v[0] + inp["y"] * v[1]
-            s, span = coil_build(inp, g, raw_bounds, raw_edges)
-            coil, _, _ = build_coil(inp["x"], inp["y"], cu, v, a, s, span,
-                                    input_target_len(k), raw_edges[e], raw_plane)
-            xs = [p[0] for p in coil]
-            ys = [p[1] for p in coil]
-            prot = {"left": raw_bounds[0] - min(xs), "right": max(xs) - raw_bounds[1],
-                    "bottom": raw_bounds[2] - min(ys), "top": max(ys) - raw_bounds[3]}[e]
-            edge_depth[e] = max(edge_depth[e], prot + WIRE_WIDTH / 2.0)  # trace edge
+        for e, items in edge_inputs(g, raw_bounds).items():
+            gaps = edge_gaps(e, raw_edges)
+            elo, ehi = edge_along_range(e, raw_bounds)
+            for (a, tl, pad), band in zip(items, solve_bands(items, elo, ehi)):
+                coil, _, _, _ = build_band_coil(pad, e, band, tl, gaps,
+                                                raw_bounds, raw_plane)
+                xs = [p[0] for p in coil]
+                ys = [p[1] for p in coil]
+                prot = {"left": raw_bounds[0] - min(xs), "right": max(xs) - raw_bounds[1],
+                        "bottom": raw_bounds[2] - min(ys), "top": max(ys) - raw_bounds[3]}[e]
+                edge_depth[e] = max(edge_depth[e], prot + WIRE_WIDTH / 2.0)  # trace edge
 
     buf = DIE_MARGIN_BUFFER
     content_w = ring_w + edge_depth["left"] + edge_depth["right"] + 2 * buf
@@ -709,14 +822,17 @@ def build_chip(ci, chip_groups, pads, bounds):
         cell.add(poly)
         geo.setdefault(key, []).append(poly)
         if ADD_LABELS and p["name"]:
-            cell.add(*gdstk.text(p["name"], LABEL_SIZE,
-                                 (p["x"] - PAD_SIZE / 2, p["y"] + PAD_SIZE / 2),
-                                 layer=LABEL_LAYER, datatype=LABEL_DT))
-            if p["io"]:
-                cell.add(*gdstk.text(p["io"].capitalize(), LABEL_SIZE,
-                                     (p["x"] - PAD_SIZE / 2,
-                                      p["y"] + PAD_SIZE / 2 + LABEL_SIZE * 1.2),
+            inset = LABEL_SIZE * 0.4                  # tuck labels inside the pad
+            lx = p["x"] - PAD_SIZE / 2 + inset
+            ty = p["y"] + PAD_SIZE / 2 - inset - LABEL_SIZE  # top text line, inside
+            if p["io"]:                               # IO tag on top, pad name below
+                cell.add(*gdstk.text(p["io"].capitalize(), LABEL_SIZE, (lx, ty),
                                      layer=LABEL_LAYER, datatype=IO_LABEL_DT))
+                cell.add(*gdstk.text(p["name"], LABEL_SIZE, (lx, ty - LABEL_SIZE * 1.2),
+                                     layer=LABEL_LAYER, datatype=LABEL_DT))
+            else:
+                cell.add(*gdstk.text(p["name"], LABEL_SIZE, (lx, ty),
+                                     layer=LABEL_LAYER, datatype=LABEL_DT))
     rows = []
     for li, group in enumerate(chip_groups):
         wpolys, grows = draw_group(group, li, bounds, cell, ci, pads)

@@ -62,6 +62,51 @@ def parse_ohms(s):
 
 
 # ----------------------------------------------------------------------
+# Calibration offsets (real resistance != theoretical)
+# ----------------------------------------------------------------------
+def canonical_rungs(rows, tol=0.05):
+    """The distinct theoretical resistance "rungs" present across the whole CSV. The
+    binary ladder doubles per rung, so values are clustered far apart; readings within
+    `tol` of each other are treated as the same rung (covers per-resistor build
+    deviation). Returns the representative (lowest) value of each cluster, ascending."""
+    rungs = []
+    for v in sorted(float(r[R_COL]) for r in rows):
+        if not rungs or v > rungs[-1] * (1 + tol):
+            rungs.append(v)
+    return rungs
+
+
+def ask_calibration(rungs):
+    """Optionally collect a measured resistance for each ladder rung from the
+    calibration chip, returning {rung: offset} where offset = measured - theoretical.
+    The same calibration set is reused for every chip/layer this session. A blank
+    answer leaves that rung uncorrected; a blank at the first prompt skips all."""
+    if input("\nApply calibration offsets (measure the calibration chip)? [y/N]: "
+             ).strip().lower() not in ("y", "yes"):
+        return {}
+    print("For each theoretical resistance, enter the MEASURED value of the matching\n"
+          "calibration resistor (blank to leave that rung uncorrected):")
+    offsets = {}
+    for rung in rungs:
+        m = parse_ohms(input(f"   ~{rung:,.0f} ohm calibration resistor measures: "))
+        if m is None:
+            print("     couldn't read that -- left uncorrected.")
+        elif m != float("inf"):
+            offsets[rung] = m - rung
+            print(f"     offset {m - rung:+,.2f} ohm")
+    return offsets
+
+
+def apply_offsets(resistors, rungs, offsets):
+    """Add each resistor's rung offset to its theoretical resistance, so the predicted
+    values match the real (fabricated) hardware. Each resistor is matched to its
+    nearest rung. Returns a new (pad, R) list sorted by corrected resistance."""
+    def corrected(R):
+        return R + offsets.get(min(rungs, key=lambda v: abs(v - R)), 0.0)
+    return sorted(((pad, corrected(R)) for pad, R in resistors), key=lambda t: t[1])
+
+
+# ----------------------------------------------------------------------
 # Decode
 # ----------------------------------------------------------------------
 def parallel(resistances):
@@ -161,6 +206,9 @@ def main():
     combos = sorted({(int(r[CHIP]), int(r[LAYER])) for r in rows})
     print(f"Chips available: {sorted({c for c, _ in combos})}")
 
+    rungs = canonical_rungs(rows)
+    offsets = ask_calibration(rungs)        # reused for every chip/layer this session
+
     # Re-prompts until a blank chip number is entered.
     while True:
         raw = input("\nChip # (blank to quit): ").strip()
@@ -179,7 +227,10 @@ def main():
         sel = [r for r in rows if int(r[CHIP]) == chip and int(r[LAYER]) == layer]
         resistors = sorted(((r[PAD], float(r[R_COL])) for r in sel),
                            key=lambda t: t[1])
-        print(f"\nChip {chip}, layer {layer}: {len(resistors)} input resistor(s)")
+        if offsets:
+            resistors = apply_offsets(resistors, rungs, offsets)
+        note = " (calibration-corrected)" if offsets else ""
+        print(f"\nChip {chip}, layer {layer}: {len(resistors)} input resistor(s){note}")
         for pad, R in resistors:
             print(f"   {pad:>12}  {R:10,.2f} ohm")
 
