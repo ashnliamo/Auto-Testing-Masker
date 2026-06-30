@@ -6,9 +6,7 @@ HERE = pathlib.Path(__file__).parent
 DEFAULT_CSV = HERE / "decode_inputs" / "pinout_grouped_parallel.csv"
 
 CHIP, LAYER, PAD, R_COL = "chip", "layer", "input_pad", "actual_R_ohm"
-# A subset is accepted as a clean match when the resistance it predicts is within
-# this fraction of the measured value (covers contact resistance + meter error).
-MATCH_TOL = 0.05
+MATCH_TOL = 0.05   # accept a subset if its predicted R is within this of measured
 
 
 # ----------------------------------------------------------------------
@@ -43,8 +41,7 @@ def ask_choice(prompt, choices):
 
 
 def parse_ohms(s):
-    """Parse a resistance like '1.2k', '470', '3.3M', 'OPEN'. Returns ohms (inf for
-    an open / over-range reading), or None if it can't be parsed."""
+    """'1.2k'/'470'/'3.3M'/'OPEN' -> ohms (inf for open), or None if unparseable."""
     s = s.strip().lower().replace(",", "").replace("ohm", "").replace("Ω", "").strip()
     if s in ("", "open", "ol", "inf", "overrange", "over"):
         return float("inf")
@@ -65,10 +62,8 @@ def parse_ohms(s):
 # Calibration offsets (real resistance != theoretical)
 # ----------------------------------------------------------------------
 def canonical_rungs(rows, tol=0.05):
-    """The distinct theoretical resistance "rungs" present across the whole CSV. The
-    binary ladder doubles per rung, so values are clustered far apart; readings within
-    `tol` of each other are treated as the same rung (covers per-resistor build
-    deviation). Returns the representative (lowest) value of each cluster, ascending."""
+    """Distinct resistance rungs in the CSV. The binary ladder doubles per rung, so
+    values within `tol` are one rung; returns each cluster's lowest value, ascending."""
     rungs = []
     for v in sorted(float(r[R_COL]) for r in rows):
         if not rungs or v > rungs[-1] * (1 + tol):
@@ -77,10 +72,9 @@ def canonical_rungs(rows, tol=0.05):
 
 
 def ask_calibration(rungs):
-    """Optionally collect a measured resistance for each ladder rung from the
-    calibration chip, returning {rung: offset} where offset = measured - theoretical.
-    The same calibration set is reused for every chip/layer this session. A blank
-    answer leaves that rung uncorrected; a blank at the first prompt skips all."""
+    """Optionally read each ladder rung off the calibration chip, returning
+    {rung: offset} with offset = measured - theoretical (reused for every chip/layer).
+    Blank leaves a rung uncorrected; declining at the first prompt skips all."""
     if input("\nApply calibration offsets (measure the calibration chip)? [y/N]: "
              ).strip().lower() not in ("y", "yes"):
         return {}
@@ -98,9 +92,8 @@ def ask_calibration(rungs):
 
 
 def apply_offsets(resistors, rungs, offsets):
-    """Add each resistor's rung offset to its theoretical resistance, so the predicted
-    values match the real (fabricated) hardware. Each resistor is matched to its
-    nearest rung. Returns a new (pad, R) list sorted by corrected resistance."""
+    """Add each resistor's nearest-rung offset so the values match real hardware.
+    Returns a new (pad, R) list sorted by corrected resistance."""
     def corrected(R):
         return R + offsets.get(min(rungs, key=lambda v: abs(v - R)), 0.0)
     return sorted(((pad, corrected(R)) for pad, R in resistors), key=lambda t: t[1])
@@ -115,9 +108,8 @@ def parallel(resistances):
 
 
 def decode_margin(conductances):
-    """Smallest gap between any two distinct subset sums of the conductances,
-    relative to the all-on sum. A parallel reading resolves the missing set only if
-    it is accurate to better than ~this fraction of the all-contacting value."""
+    """Smallest gap between any two subset sums, relative to the all-on sum: the
+    reading must beat this fraction for the missing set to be unique."""
     n = len(conductances)
     sums = sorted(sum(conductances[i] for i in range(n) if mask >> i & 1)
                   for mask in range(1 << n))
@@ -127,10 +119,8 @@ def decode_margin(conductances):
 
 
 def rank_subsets(resistors, r_meas):
-    """Score every subset of `resistors` by how well its REMOVAL explains r_meas.
-    A removed subset has conductance Gsub; the network that remains reads
-    1/(G_all - Gsub). Returns the subsets as (pred_R, missing_idx_tuple), best fit
-    first. `resistors` is a list of (pad, R)."""
+    """Score every subset by how well its REMOVAL explains r_meas (the rest reads
+    1/(G_all - Gsub)). Returns (pred_R, missing_idx) list, best fit first."""
     g = [1.0 / R for _, R in resistors]
     G_all = sum(g)
     G_meas = 1.0 / r_meas if r_meas not in (0, float("inf")) else (
@@ -182,8 +172,7 @@ def report(resistors, r_meas):
     if err > MATCH_TOL:
         print(f"  ! Best fit is {err*100:.1f}% off (> {MATCH_TOL*100:.0f}%); treat the "
               "result as approximate -- the reading may sit between resistor sums.")
-    # flag ambiguity: another subset with a clearly different missing set predicts
-    # nearly the same resistance
+    # flag ambiguity: a different missing set predicting nearly the same resistance
     for pred2, idx2 in ranked[1:]:
         if set(idx2) == set(idx):
             continue
@@ -207,10 +196,9 @@ def main():
     print(f"Chips available: {sorted({c for c, _ in combos})}")
 
     rungs = canonical_rungs(rows)
-    offsets = ask_calibration(rungs)        # reused for every chip/layer this session
+    offsets = ask_calibration(rungs)
 
-    # Re-prompts until a blank chip number is entered.
-    while True:
+    while True:                             # one decode per chip/layer; blank quits
         raw = input("\nChip # (blank to quit): ").strip()
         if raw == "":
             break

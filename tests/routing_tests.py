@@ -144,9 +144,14 @@ def evaluate(pads):
                                bounds[2] - min(cy), max(cy) - bounds[3])
                 whole[k] = (gdstk.FlexPath(coil, iopw.WIRE_WIDTH).to_polygons()
                             + gdstk.FlexPath(ret, iopw.WIRE_WIDTH).to_polygons())
-        ks = sorted(whole)
-        for i in range(len(ks)):                 # any two DISTINCT inputs touching
+        ks = sorted(whole)                       # any two DISTINCT inputs touching
+        bb = {k: iopw.group_bbox(whole[k]) for k in ks}
+        for i in range(len(ks)):
+            xa0, ya0, xa1, ya1 = bb[ks[i]]
             for j in range(i + 1, len(ks)):
+                xb0, yb0, xb1, yb1 = bb[ks[j]]
+                if xa1 < xb0 or xb1 < xa0 or ya1 < yb0 or yb1 < ya0:
+                    continue                     # disjoint bboxes -> can't overlap
                 if gdstk.boolean(whole[ks[i]], whole[ks[j]], "and"):
                     crossings += 1
         worst_margin = min(worst_margin, subset_sum_margin([1.0 / R for R in Rs]))
