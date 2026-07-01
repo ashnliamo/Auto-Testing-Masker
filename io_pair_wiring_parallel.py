@@ -9,6 +9,9 @@ import gdstk
 HERE = pathlib.Path(__file__).parent
 INPUT_DIR = HERE / "inputs"
 OUTPUT_DIR = HERE / "outputs"
+GDS_DIR = OUTPUT_DIR / "gds"                # chip mask GDS files
+SCHEMATIC_DIR = OUTPUT_DIR / "schematics"  # per-chip circuit diagrams (SVG)
+CALIB_DIR = OUTPUT_DIR / "calibration"     # calibration coupon GDS + CSV
 
 PAD_SIZE = 80.0
 WIRE_WIDTH = 3.0           # aluminium trace width
@@ -694,6 +697,86 @@ def build_calibration(resistances):
 
 
 # ----------------------------------------------------------------------
+# Schematic (a circuit diagram per chip, one block per layer)
+# ----------------------------------------------------------------------
+def _resistor_zig(x0, x1, y, teeth=6, amp=7.0):
+    """SVG polyline points for a horizontal resistor symbol from x0 to x1."""
+    lead = (x1 - x0) * 0.13
+    a, b = x0 + lead, x1 - lead
+    step = (b - a) / teeth
+    pts = [(x0, y), (a, y)]
+    for i in range(teeth):
+        pts.append((a + (i + 0.5) * step, y + (amp if i % 2 == 0 else -amp)))
+    pts += [(b, y), (x1, y)]
+    return " ".join(f"{px:.1f},{py:.1f}" for px, py in pts)
+
+
+def build_schematic_svg(chip_idx, rows):
+    """A circuit diagram for one chip: for each layer (coupon) every INPUT pad is
+    drawn as a node wired through its resistor (zigzag) to the shared OUTPUT node.
+    `rows` are that chip's CSV rows; returns the SVG text."""
+    by_layer = {}
+    for r in rows:
+        by_layer.setdefault(int(r[1]), []).append(r)
+
+    x_name, x_term, x_r0, x_r1, x_bus, x_out = 14, 150, 162, 300, 430, 452
+    row_h, head_h, foot_h, gap = 46, 40, 60, 30
+    width = 640
+    body, y = [], 20.0
+    for layer in sorted(by_layer):
+        rs = by_layer[layer]
+        outs = rs[0][4]
+        gpar = rs[0][7]
+        top = y
+        body.append(f'<text x="{x_name}" y="{top:.0f}" class="ttl">'
+                    f'Chip {chip_idx} — Layer {layer}  '
+                    f'(all-parallel {gpar} Ω)</text>')
+        row_y = top + head_h
+        ys = [row_y + i * row_h for i in range(len(rs))]
+        for (row, ry) in zip(rs, ys):
+            _, _, pad, sig, _, r_ohm, _, _ = row
+            body.append(f'<rect x="{x_term-9:.0f}" y="{ry-9:.0f}" width="18" '
+                        f'height="18" class="pad"/>')
+            body.append(f'<text x="{x_name}" y="{ry-2:.0f}" class="lbl">{pad}</text>')
+            if sig:
+                body.append(f'<text x="{x_name}" y="{ry+11:.0f}" '
+                            f'class="sig">{_esc(sig)}</text>')
+            body.append(f'<line x1="{x_term+9:.0f}" y1="{ry:.0f}" x2="{x_r0:.0f}" '
+                        f'y2="{ry:.0f}" class="wire"/>')
+            body.append(f'<polyline points="{_resistor_zig(x_r0, x_r1, ry)}" '
+                        f'class="wire"/>')
+            body.append(f'<text x="{(x_r0+x_r1)/2:.0f}" y="{ry-12:.0f}" '
+                        f'class="val" text-anchor="middle">{r_ohm} Ω</text>')
+            body.append(f'<line x1="{x_r1:.0f}" y1="{ry:.0f}" x2="{x_bus:.0f}" '
+                        f'y2="{ry:.0f}" class="wire"/>')
+        # shared output node: vertical bus tying every resistor, then out to the pad
+        oy = ys[-1] + foot_h - 24
+        body.append(f'<line x1="{x_bus:.0f}" y1="{ys[0]:.0f}" x2="{x_bus:.0f}" '
+                    f'y2="{oy:.0f}" class="bus"/>')
+        body.append(f'<line x1="{x_bus:.0f}" y1="{oy:.0f}" x2="{x_out:.0f}" '
+                    f'y2="{oy:.0f}" class="wire"/>')
+        body.append(f'<circle cx="{x_out:.0f}" cy="{oy:.0f}" r="4" class="node"/>')
+        body.append(f'<text x="{x_out+10:.0f}" y="{oy+4:.0f}" class="lbl">'
+                    f'OUTPUT: {_esc(outs)}</text>')
+        y = ys[-1] + foot_h + gap
+    height = y
+    style = ("<style>.wire{stroke:#222;stroke-width:1.6;fill:none}"
+             ".bus{stroke:#222;stroke-width:2.4;fill:none}"
+             ".pad{fill:#fff;stroke:#222;stroke-width:1.6}.node{fill:#222}"
+             ".lbl{font:12px sans-serif;fill:#111}.sig{font:10px sans-serif;fill:#666}"
+             ".val{font:11px sans-serif;fill:#0645ad}"
+             ".ttl{font:600 14px sans-serif;fill:#000}</style>")
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height:.0f}" viewBox="0 0 {width} {height:.0f}">'
+            f'{style}<rect width="{width}" height="{height:.0f}" fill="#fff"/>'
+            + "".join(body) + "</svg>")
+
+
+def _esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 def find_input_csv():
@@ -866,7 +949,8 @@ def main():
     xs = [p["x"] for p in pads]
     ys = [p["y"] for p in pads]
     bounds = (min(xs), max(xs), min(ys), max(ys))
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    for d in (OUTPUT_DIR, GDS_DIR, SCHEMATIC_DIR, CALIB_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
     chips = pack_chips(coupons, groups_per_chip)
     print(f"{layers}-layer chips: up to {groups_per_chip} layer(s) per chip "
@@ -881,8 +965,11 @@ def main():
         lib, geo, rows = build_chip(ci, chip_coupons, pads, bounds)
         all_rows.extend(rows)
         tags = [tag(c) for c in chip_coupons]
-        gds_out = safe_path(OUTPUT_DIR / f"groups_{'_'.join(tags)}.gds")
+        gds_out = safe_path(GDS_DIR / f"groups_{'_'.join(tags)}.gds")
         lib.write_gds(gds_out)
+        safe_path(SCHEMATIC_DIR / f"schematic_{'_'.join(tags)}.svg").write_text(
+            build_schematic_svg(ci, rows), encoding="utf-8")   # circuit diagram
+
         shorts = find_shorts(geo, len(chip_coupons))
         if shorts:
             print(f"  ! chip {ci} ({'_'.join(tags)}): {len(shorts)} cross-net overlap(s)")
@@ -899,9 +986,9 @@ def main():
     # Calibration coupon (resistances match the on-chip ladder).
     calib_res = [input_target_r(k) for k in range(1, CALIB_COUNT + 1)]
     calib_lib, calib_rows, cdw, cdh = build_calibration(calib_res)
-    calib_gds = safe_path(OUTPUT_DIR / "calibration_resistors.gds")
+    calib_gds = safe_path(CALIB_DIR / "calibration_resistors.gds")
     calib_lib.write_gds(calib_gds)
-    calib_csv = safe_path(OUTPUT_DIR / "calibration_resistors.csv")
+    calib_csv = safe_path(CALIB_DIR / "calibration_resistors.csv")
     with open(calib_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["target_R_ohm", "theoretical_R_ohm", "squares", "trace_len_um"])

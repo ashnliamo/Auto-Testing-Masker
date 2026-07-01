@@ -157,8 +157,10 @@ def report(resistors, r_meas):
     margin = decode_margin([1.0 / R for _, R in resistors])
     print(f"\nAll-contacting parallel resistance: {r_all:,.2f} ohm "
           f"({len(resistors)} resistor(s)).")
-    print(f"Decode margin {margin*100:.2f}%: the reading must be accurate to better "
-          f"than this (incl. contact resistance) for the missing set to be unique.")
+    margin_ohm = margin * r_all                      # resolution near the all-on reading
+    print(f"Decode margin {margin*100:.2f}% (~{margin_ohm:,.2f} ohm): the reading must "
+          f"be accurate to better than this (incl. contact resistance) for the missing "
+          f"set to be unique.")
 
     if r_meas != float("inf") and r_meas < r_all * (1 - MATCH_TOL):
         print(f"  ! Measured {r_meas:,.2f} ohm is BELOW the all-contacting value -- "
