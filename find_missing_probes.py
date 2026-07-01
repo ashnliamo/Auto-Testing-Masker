@@ -3,7 +3,7 @@ import sys
 import pathlib
 
 HERE = pathlib.Path(__file__).parent
-DEFAULT_CSV = HERE / "decode_inputs" / "pinout_grouped_parallel.csv"
+DECODE_DIR = HERE / "decode_inputs"
 
 CHIP, LAYER, PAD, R_COL = "chip", "layer", "input_pad", "actual_R_ohm"
 MATCH_TOL = 0.05   # accept a subset if its predicted R is within this of measured
@@ -12,6 +12,19 @@ MATCH_TOL = 0.05   # accept a subset if its predicted R is within this of measur
 # ----------------------------------------------------------------------
 # Input
 # ----------------------------------------------------------------------
+def find_decode_csv():
+    """The single CSV in decode_inputs/ (any name). Errors if none or several."""
+    csvs = sorted(DECODE_DIR.glob("*.csv"))
+    if not csvs:
+        raise SystemExit(f"No .csv found in {DECODE_DIR} -- put the generator's "
+                         f"*_parallel.csv there.")
+    if len(csvs) > 1:
+        names = ", ".join(p.name for p in csvs)
+        raise SystemExit(f"Multiple .csv files in {DECODE_DIR} ({names}); keep just one, "
+                         f"or pass the path: py find_missing_probes.py <file.csv>")
+    return csvs[0]
+
+
 def load(path):
     if not path.exists():
         raise SystemExit(f"Input CSV not found: {path}\n"
@@ -189,7 +202,7 @@ def report(resistors, r_meas):
 # Main
 # ----------------------------------------------------------------------
 def main():
-    path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CSV
+    path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else find_decode_csv()
     rows = load(path)
     print(f"Loaded {len(rows)} coil(s) from {path}")
     combos = sorted({(int(r[CHIP]), int(r[LAYER])) for r in rows})

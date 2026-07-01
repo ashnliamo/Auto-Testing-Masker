@@ -7,7 +7,7 @@ import pathlib
 import gdstk
 
 HERE = pathlib.Path(__file__).parent
-INPUT_CSV = HERE / "inputs" / "pinout_grouped.csv"
+INPUT_DIR = HERE / "inputs"
 OUTPUT_DIR = HERE / "outputs"
 
 PAD_SIZE = 80.0
@@ -696,8 +696,21 @@ def build_calibration(resistances):
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
+def find_input_csv():
+    """The single spreadsheet in inputs/ (any .csv name). Errors if none or several."""
+    csvs = sorted(INPUT_DIR.glob("*.csv"))
+    if not csvs:
+        raise SystemExit(f"No .csv found in {INPUT_DIR} -- put your pinout there.")
+    if len(csvs) > 1:
+        names = ", ".join(p.name for p in csvs)
+        raise SystemExit(f"Multiple .csv files in {INPUT_DIR} ({names}); keep just one, "
+                         f"or pass the path: py io_pair_wiring_parallel.py <file.csv>")
+    return csvs[0]
+
+
 def parse_args(argv):
-    """(csv_path, layers). `--layers 1|2` skips the prompt; else layers is None."""
+    """(csv_path, layers). `--layers 1|2` skips the prompt; else layers is None.
+    With no path given, uses whatever single .csv sits in inputs/."""
     layers, pos = None, []
     i = 1
     while i < len(argv):
@@ -707,7 +720,7 @@ def parse_args(argv):
         else:
             pos.append(argv[i])
             i += 1
-    csv_path = pathlib.Path(pos[0]) if pos else INPUT_CSV
+    csv_path = pathlib.Path(pos[0]) if pos else find_input_csv()
     return csv_path, (int(layers) if layers in ("1", "2") else None)
 
 
